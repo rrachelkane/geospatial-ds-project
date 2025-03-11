@@ -1,0 +1,672 @@
+---
+title: 'Geospatial Data Science Project: Trends in Citibike Usage in NYC following the NYC Congestion Pricing Plan'
+author: "Jessica Cairns, Rachel Kane, Sally Rafter"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    number_sections: true
+    toc_float: true
+    df-print: paged
+    fig-width: 9
+    fig-height: 6
+    page-layout: full
+---
+
+```{r}
+#----------------------------------
+# SET-UP
+#----------------------------------
+
+# install and load in pacman
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+
+# install and load packages with pacman
+# edit these to what we actually use
+p_load(concaveman, rstudioapi, data.table, lubridate, tidyr, tigris, dplyr, knitr, sf, sp, spData, terra, exactextractr, raster, gdistance, data.table, haven, leaflet, ggplot2, readxl, ggspatial, rnaturalearth, rnaturalearthdata, grid, mapview)
+
+# 1 - location of wll input data
+# for now, not keeping this in the Git as its very large; storing locally, can update down the line
+offgit_data_wd <- "C:/Users/rache/OneDrive/Documents/GitHub/bse-masters/geospatial-data-science/input" 
+
+#----------------------------------
+# LOADING IN DATA 
+#----------------------------------
+
+# we use data.table for computational efficiency, due to volume of the citibike data
+
+# load in citibike data sheets for jan 2025 dynamically, store in list, then delete the individual file to free up storage
+file_names <- c("202501-citibike-tripdata_1.csv", "202501-citibike-tripdata_2.csv", "202501-citibike-tripdata_3.csv")
+cb_all <- NULL
+
+for (file in file_names) {
+  cb_temp <- fread(file.path(offgit_data_wd, file))
+  cb_all <- if (is.null(cb_all)) cb_temp else rbindlist(list(cb_all, cb_temp), use.names = TRUE)
+  rm(cb_temp)
+  gc()
+}
+
+# inspect
+str(cb_all)
+dim(cb_all)
+
+#----------------------------------
+# DATA CLEANING I: MISSING VALUES
+#----------------------------------
+
+# check columns with missing values
+na_cols <- colSums(is.na(cb_all)) 
+na_cols <- na_cols[na_cols > 0] 
+print(na_cols) 
+rm(na_cols)
+
+# drop trips with missing values in any column
+cb_all <- na.omit(cb_all)
+
+# drop any trips with empty character entry in station names
+cb_all <- cb_all[start_station_name != "" | end_station_name != ""]
+
+# verify cleaning
+dim(cb_all)
+
+#----------------------------------
+# DATA CLEANING II: START AND END POINTS
+#----------------------------------
+
+# NB - because Citibike is a station-based system, we don't need to keep the start and end lat and long for each trip;
+# because if we know the trip's start station and end station, we know these by default
+
+# in principle, we could just keep this in if coordinates were constant within given station, but they are not, as shown below
+# that is, start lat/long should not vary within a given start station, and the same for end stations
+
+# therefore, we make a separate dataframe to store the points for each station, drop the 4 lat/long columns from the
+# big cb_all dataset to improve computational efficiency, and merge the station location data in later when needed using
+# start or end station name as the id with which to merge
+
+# but first, let's verify that coordinates are constant for a given station:
+
+# identify start stations with varying locations for example
+start_station_varying_location <- cb_all %>%
+  group_by(start_station_name) %>%
+  summarise(unique_lat_count = n_distinct(start_lat),
+            unique_lng_count = n_distinct(start_lng)) %>%
+  filter(unique_lat_count > 1 | unique_lng_count > 1) %>%
+  dplyr::select(start_station_name)
+
+# check values and their frequencies
+cb_all %>%
+  semi_join(start_station_varying_location, by = "start_station_name") %>%  # Keep only relevant stations
+  group_by(start_station_name, start_lat, start_lng) %>%
+  summarise(frequency = n(), .groups = "drop") %>%
+  arrange(start_station_name, desc(frequency)) %>% 
+  head(20) %>% # only show first 20 as an example
+  kable()
+
+# we can see here that there will be a similar problem of non-uniqueness for end stations
+# so given this, now we want to create separate data.tables storing start points and end points, assigning each station only the most frequent coordinate obs
+
+# ensure coordinate variables are numeric
+cb_all[, c("start_lat", "start_lng", "end_lat", "end_lng") := lapply(.SD, as.numeric), 
+       .SDcols = c("start_lat", "start_lng", "end_lat", "end_lng")]
+
+# identify the most frequent lat/lng for each start station, store as a data.table
+start_points_sf <- cb_all[, .(frequency = .N), by = .(start_station_name, start_lat, start_lng)
+][order(start_station_name, -frequency)
+][, .SD[which.max(frequency)], by = start_station_name
+][, frequency := NULL] %>% 
+  st_as_sf(coords = c("start_lng", "start_lat"), crs = 4326)
+
+# identify the most frequent lat/lng for each end station
+end_points_sf <- cb_all[, .(frequency = .N), by = .(end_station_name, end_lat, end_lng)
+][order(end_station_name, -frequency)
+][, .SD[which.max(frequency)], by = end_station_name
+][, frequency := NULL]  %>% 
+  st_as_sf(coords = c("end_lng", "end_lat"), crs = 4326)
+
+# note that it is easiest here to add census tract id for each station, calculating interaction with CRZ (need to make DT)
+
+nyc_tract <- st_read(file.path(offgit_data_wd, "nyct2020_25a", "nyct2020.shp"))
+st_crs(nyc_tract)
+nyc_tract <- st_transform(nyc_tract, 4326) # ensure crs conssistency
+st_crs(nyc_tract)
+
+st_crs(start_points_sf)
+st_crs(end_points_sf)
+
+# assign tract and borough to each start station
+start_points_sf <- st_join(start_points_sf, nyc_tract, left = TRUE) %>%
+  dplyr::select(start_station_name, start_tract_id = CT2020, start_borough_name = BoroName, geometry)
+
+# same for end
+end_points_sf <- st_join(end_points_sf, nyc_tract, left = TRUE) %>%
+  dplyr::select(end_station_name, end_tract_id = CT2020, end_borough_name = BoroName, geometry)
+
+# verify crs still correct
+st_crs(start_points_sf)
+st_crs(end_points_sf)
+
+# check for any NAs
+print(sum(is.na(start_points_sf$start_tract_id)))
+print(sum(is.na(end_points_sf$end_tract_id)))
+
+# inspect
+start_points_sf %>% 
+  filter(is.na(start_tract_id)) %>% 
+  head() # liberty light rail in NJ? + LA demo?
+# only n=2 obs in cb all, so can drop
+
+end_points_sf %>% 
+  filter(is.na(end_tract_id)) %>% 
+  head()
+
+na_end_tract <- end_points_sf %>% 
+  filter(is.na(end_tract_id)) # approx 160 or so obs in cball
+
+# nb - looks like these ended in NJ, so need info on that?
+# going to drop them for now.
+# should also look back into spatial join to make sure doing correctly...
+
+# drop
+start_points_sf <- na.omit(start_points_sf)
+end_points_sf <- na.omit(end_points_sf)
+
+# sense check
+ggplot() +
+  geom_sf(data = nyc_tract, fill = "gray90", color = "white", size = 0.1) +  
+  geom_sf(data = start_points_sf, aes(color = start_borough_name), size = 2, alpha = 0.8) +
+  labs(
+    title = "Citibike Start Stations by Borough, January 2025",
+    caption = "Source: Citibike Data",
+    color = "Borough"
+  ) +
+  theme_classic() 
+
+ggplot() +
+  geom_sf(data = nyc_tract, fill = "gray90", color = "white", size = 0.1) +  
+  geom_sf(data = end_points_sf, aes(color = end_borough_name), size = 2, alpha = 0.8) +
+  labs(
+    title = "Citibike End Stations by Borough, January 2025",
+    caption = "Source: Citibike Data",
+    color = "Borough"
+  ) +
+  theme_classic() 
+
+
+rm(start_station_varying_location) # only an example
+#----------------------------------
+# DATA CLEANING III: COLUMN CLEANING
+#----------------------------------
+
+# now that we have already stored this information, let's drop these coordinate variables, along with some others that we are not analysing, at least for now
+cb_all[, c("start_lat", "start_lng", "end_lat", "end_lng", "rideable_type", "member_casual", "ride_id", "start_station_id", "end_station_id") := NULL]
+
+# check new dim
+dim(cb_all)
+head(cb_all)
+
+# now we create time variables from the start_at variables in order to create the desired level of aggregation of the analysis
+# note might be able to remove some of these if not used
+
+cb_all[, date := as.Date(started_at)]  # Ensure date is computed first
+
+cb_all[, `:=`(
+  year = year(date),
+  month = month(date),
+  day = day(date),
+  weekday = weekdays(date),  
+  start_hour = hour(started_at),
+  end_hour = hour(ended_at),
+  trip_duration = as.numeric(difftime(ended_at, started_at, units = "mins"))
+)][, c("started_at", "ended_at") := NULL]
+
+# these wont work on one - need to check
+cb_all[, is_weekend := weekdays(date) %in% c("Saturday", "Sunday")]
+cb_all[, peak_period := ifelse(
+  (!is_weekend & start_hour >= 5 & start_hour < 21) | 
+    (is_weekend & start_hour >= 9 & start_hour < 21),
+  "peak", "off-peak")
+]
+
+# inspect
+head(cb_all)
+
+# look for any outliers in trip time
+summary(cb_all$trip_duration)
+print(sum(cb_all$duration <= 60))
+
+# looks reasonable to filter to those less than 60 mins in duration for now
+cb_all <- cb_all[trip_duration <= 60]
+
+# note there are some from december here to - will remove for just jan comparison for now
+cb_all <- cb_all[month != 12]
+
+# some missing days and hours
+print(sum(is.na(cb_all$day)))
+print(sum(is.na(cb_all$start_hour)))
+
+cb_all <- na.omit(cb_all)
+dim(cb_all)
+#----------------------------------
+# DATA CLEANING IV - AGGREGATION
+#----------------------------------
+
+# now we aggregate
+# note may keep month here if rel
+cb_all <- cb_all[, .(
+  trip_count = .N,
+  mean_trip_duration = mean(trip_duration, na.rm = TRUE)
+), by = .(start_hour, peak_period, day, weekday, year, start_station_name, end_station_name)
+][order(start_station_name, end_station_name, day, weekday, start_hour, peak_period)
+][, .(trip_count, peak_period, day, weekday, year, start_station_name, end_station_name, mean_trip_duration, start_hour)]
+
+
+# note here - keeping start hour too, useful for data viz temporal plots, can agg to peak periods after
+# inspect
+head(cb_all)
+dim(cb_all)
+
+#----------------------------------
+# DATA CLEANING V - INCORPORATING SPATIAL INFORMATION
+#----------------------------------
+
+# SALLY CODE HERE
+
+file_path <- file.path(offgit_data_wd, "dcm_20241231shp", "DCM_StreetCenterLine.shp")
+
+sf.data <- st_read(
+  dsn = file_path,
+  layer = "DCM_StreetCenterLine"
+)
+
+# Always check/transform to WGS84 if needed
+sf.data <- st_transform(sf.data, 4326)
+
+# Remove 3rd dimension
+sf.data <- st_zm(sf.data)
+
+# Filter for only mapped / city streets
+sf.road <- sf.data %>% 
+  filter(Feat_Type == "Mapped_St") %>% 
+  filter(Feat_statu == "City_St") %>% 
+  filter(Borough == "Manhattan") %>% 
+  mutate(segment_id = as.character(row_number()))
+
+# Leaflet map of Manhattan
+manhattan_map <- leaflet(sf.road) %>% 
+  addPolylines(weight = 0.8, popup = ~segment_id) %>% 
+  addTiles() %>% 
+  addProviderTiles(leaflet::providers$CartoDB.Positron) 
+
+manhattan_map
+
+##### CPZ Boundary #####
+
+# General boundary
+sf.boundary <- sf.road %>% 
+  filter(Street_NM %in% c("12 Avenue", 
+                          "12 Avenue / Riverside", 
+                          "12 Avenue / Riverside Viaduct",
+                          "Joe Dimaggio Highway",
+                          "11 Avenue", 
+                          "West Street",
+                          "State Street",
+                          "South Street",
+                          "Franklin D. Roosevelt Drive",
+                          "East 60 Street", 
+                          "West 60 Street",
+                          "Central Park South")) %>% 
+  mutate(segment_id = as.character(row_number()))
+
+# Boundary map in progress with segment ids displayed so can filter appropriately
+boundary_map <- leaflet(sf.boundary) %>% 
+  addPolylines(weight = 0.8, popup = ~segment_id) %>% 
+  addTiles() %>% 
+  addProviderTiles(leaflet::providers$CartoDB.Positron)
+
+boundary_map
+
+# Remove following segments which roughly lie outside CPZ
+sf.boundary <- sf.boundary %>% 
+  filter(segment_id != 2) %>% 
+  filter(segment_id != 4) %>% 
+  filter(segment_id != 5) %>% 
+  filter(segment_id != 9) %>% 
+  filter(segment_id != 12) %>% 
+  filter(segment_id != 14) %>% 
+  filter(segment_id != 15) %>% 
+  filter(segment_id != 20) %>% 
+  filter(segment_id != 21) %>% 
+  filter(segment_id != 24) %>% 
+  filter(segment_id != 25) %>% 
+  filter(segment_id != 26) %>% 
+  filter(segment_id != 27) %>% 
+  filter(segment_id != 32) %>% 
+  filter(segment_id != 36) %>% 
+  filter(segment_id != 40) %>% 
+  filter(segment_id != 44) %>% 
+  filter(segment_id != 42) %>% 
+  filter(segment_id != 48) %>% 
+  filter(segment_id != 49) %>% 
+  filter(segment_id != 54) %>% 
+  filter(segment_id != 56) %>% 
+  filter(segment_id != 57) %>% 
+  filter(segment_id != 58) %>% 
+  filter(segment_id != 62) %>% 
+  filter(segment_id != 65) %>% 
+  filter(segment_id != 66) %>% 
+  filter(segment_id != 69) %>% 
+  filter(segment_id != 70) %>% 
+  filter(segment_id != 78) %>% 
+  filter(segment_id != 92) %>% 
+  filter(segment_id != 93) %>% 
+  filter(segment_id != 94) %>% 
+  filter(segment_id != 95) %>% 
+  filter(segment_id != 96) %>% 
+  filter(segment_id != 97) %>% 
+  filter(segment_id != 98) %>% 
+  filter(segment_id != 99) %>% 
+  filter(segment_id != 100) %>% 
+  filter(segment_id != 101) %>% 
+  filter(segment_id != 102) %>% 
+  filter(segment_id != 103) %>% 
+  filter(segment_id != 104) 
+
+boundary_map <- leaflet(sf.boundary) %>% 
+  addPolylines(weight = 2, popup = ~segment_id) %>% 
+  addTiles() %>% 
+  addProviderTiles(leaflet::providers$CartoDB.Positron)
+
+boundary_map
+
+# Approximate boundary as singular polygon
+sf.boundary_proj <- sf.boundary %>%
+  st_transform(2263)
+
+# Extract all vertices from the boundary lines
+sf.boundary_points <- st_cast(sf.boundary_proj, "POINT")
+
+# Convert to an sf POINT dataframe
+sf.boundary_sf <- st_as_sf(sf.boundary_points)
+
+# Apply concave hull (realistic boundary shape)
+sf.boundary_polygon <- concaveman(sf.boundary_sf)
+
+# Transform back to WGS84 for mapping
+sf.boundary_proj <- st_transform(sf.boundary_polygon, 4326)
+
+# Map boundary
+boundary_map <- leaflet(sf.boundary_proj) %>% 
+  addPolylines(weight = 2) %>% 
+  addTiles() %>% 
+  addProviderTiles(leaflet::providers$CartoDB.Positron)
+
+boundary_map
+
+# now rachel continuing on
+
+# double check coonsistency of CRS of the different objects before looking at their interaction
+st_crs(sf.boundary_proj)
+st_crs(start_points_sf)
+st_crs(end_points_sf)
+
+# convert to dt for efficiency
+setDT(start_points_sf)
+setDT(end_points_sf)
+
+# calculate interaction with CPZ for start stations: which are within the zone? - double check
+start_points_sf <- start_points_sf[, geometry := st_transform(geometry, st_crs(sf.boundary_proj))
+][, start_in_cpz := st_within(geometry, sf.boundary_proj, sparse = FALSE)
+]
+
+# calculate interaction with CPZ for end stations: which are within the zone? - double check
+end_points_sf <- end_points_sf[, geometry := st_transform(geometry, st_crs(sf.boundary_proj))
+][, end_in_cpz := st_within(geometry, sf.boundary_proj, sparse = FALSE)
+]
+
+# now, given the spatial information of interest has been retrieved, merge back into the origin-destination-peakhour-day trip data
+cb_all <- cb_all[start_points_sf, on = "start_station_name"]
+cb_all <- cb_all[end_points_sf, on = "end_station_name"]
+
+# add trip type indicator
+cb_all[, trip_type := fcase(
+  start_in_cpz & !end_in_cpz, "Exited CPZ",
+  !start_in_cpz & end_in_cpz, "Entered CPZ",
+  start_in_cpz & end_in_cpz,  "Stayed Inside CPZ",
+  default = "Stayed Outside CPZ"
+)]
+
+# check
+head(cb_all)
+dim(cb_all)
+
+#-----------------
+
+# EXPLORATORY DATA VIZ - NON-SPATIAL
+
+#-----------------
+
+# note this has lots of duplication etc atm just very exploratory
+
+# basic table of counts and mean duration by type
+ cb_all %>% 
+  group_by(trip_type) %>% 
+  summarise(total_trip_count = n(), # nb here to not use means, just sum
+            mean_trip_duration = mean(mean_trip_duration)) %>% 
+  kable(caption = "Trip Summary Statistics by Trip Type and Day of Week, Jan 2025", col.names = c("Trip Type", "Total Trip Count", "Mean Trip Duration"))
+
+# plot 1 - stacked bar chart - proportion of trip types by day
+daily_counts_by_type <- cb_all %>%
+  group_by(day, trip_type) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(day) %>%  # Group again to compute the daily total correctly
+  mutate(
+    daily_total = sum(count),  # Compute total trips that day
+    relative_frequency = (count / daily_total) * 100  # Compute percentage
+  )
+
+ggplot(daily_counts_by_type, aes(x = factor(day), y = relative_frequency, fill = trip_type)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_brewer(palette = "Set3") + 
+  labs(
+    title = "Proportion of Trip Types by Day in January 2025",
+    x = "Day of January",
+    y = "Percentage of Trips",
+    fill = "Trip Type"
+  ) +
+  theme_classic()
+
+# plot 2 - line plot of trip counts by day and type
+ggplot(daily_counts_by_type, aes(x = day, y = count, color = trip_type, group = trip_type)) +
+  geom_line(size = 1) +  # Draw lines for each trip type
+  geom_point(size = 2) +  # Add points for visibility
+  scale_color_brewer(palette = "Dark2") + 
+  scale_x_continuous(breaks = seq(0, 35, by = 2)) + # Use color palette for better distinction
+  labs(
+    title = "Daily Trip Counts by Type in January 2025",
+    x = "Day of January",
+    y = "Trip Count",
+    color = "Trip Type"
+  ) +
+  theme_classic()
+
+# plot 3 - trip type counts by pricing period
+
+# note not sure if any of these that telling or if hourly better
+daily_counts_by_type_peak <- cb_all %>%
+  group_by(day, peak_period, trip_type) %>%
+  summarise(count = n(), .groups = "drop") 
+
+# dont know which of these, if any, is most useful
+ggplot(daily_counts_by_type_peak, aes(x = day, y = count, color = peak_period, group = peak_period)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ trip_type, nrow = 2) +  # Separate peak vs. off-peak periods
+  scale_color_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = seq(0, 35, by = 2)) +  
+  labs(
+    title = "Trip Type Proportion: Peak vs. Off-Peak by Day (January 2025)",
+    x = "Day of January",
+    y = "Count of Trips",
+    color = "Congestion Pricing Peak Hours"
+  ) +
+  theme_classic()
+
+ggplot(daily_counts_by_type_peak, aes(x = day, y = count, fill = peak_period)) +
+  geom_area(alpha = 0.6, position = "stack") +
+  facet_wrap(~ trip_type, nrow = 4, scales = "free_y") +  # Allow different scales per trip type
+  scale_fill_manual(values = c("peak" = "red", "off-peak" = "blue")) +
+  scale_x_continuous(breaks = seq(0, 35, by = 2)) +  
+  labs(
+    title = "Trip Trends: Peak vs. Off-Peak (January 2025)",
+    x = "Day of January",
+    y = "Trip Count",
+    fill = "Period"
+  ) +
+  theme_minimal()
+
+#---
+
+# Prepare data: Aggregate by day & hour
+plot4 <- cb_all %>%
+  group_by(year, day, start_hour, trip_type) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(hour_continuous = (day - 1) * 24 + start_hour)  # Convert (day, hour) into continuous hour values
+
+# Define breaks & labels correctly
+unique_days <- unique(plot4$day)
+break_positions <- (unique_days - 1) * 24  # Midnight of each day
+break_labels <- unique_days  # Days of the month
+
+# Create a dataframe for peak shading
+peak_shading <- expand.grid(day = 5:max(unique_days), year = unique(plot4$year)) %>%
+  mutate(
+    is_weekend = weekdays(as.Date(paste(year, "01", day, sep = "-"))) %in% c("Saturday", "Sunday"),
+    start_hour = ifelse(is_weekend, 9, 5),
+    end_hour = 21,
+    start_continuous = (day - 1) * 24 + start_hour,
+    end_continuous = (day - 1) * 24 + end_hour
+  )
+
+# Create the plot
+ggplot(plot4, aes(x = hour_continuous, y = count, color = trip_type, group = trip_type)) +
+  # Shaded peak pricing areas
+  geom_rect(data = peak_shading, inherit.aes = FALSE,
+            aes(xmin = start_continuous, xmax = end_continuous, ymin = 0, ymax = Inf),
+            fill = "darkgrey", alpha = 0.2) +  # Light shading for peak hours
+  geom_line(size = 1) +
+  geom_point(size = 1.2) +
+  facet_wrap(~year, nrow = 2) +
+  scale_color_brewer(palette = "Dark2") +  
+  scale_x_continuous(
+    breaks = break_positions,  # Midnight of each day
+    labels = break_labels  # Label with the day number
+  ) +
+  labs(
+    title = "Continuous Hourly Trip Trends by Type with Peak Pricing Periods",
+    x = "Day of January",
+    y = "Trip Count",
+    color = "Trip Type"
+  ) +
+  theme_classic()
+
+
+#-----------
+# need to think more on what is of interest, probs will evolve as we go on
+
+# some other ones
+
+ggplot(data = cb_all, aes(x = mean_trip_duration, fill = factor(weekday))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot of Mean Trip Duration, January 2025",
+       x = "Mean Trip Duration (minutes)",
+       y = "Density",
+       fill = "Weekday") +
+  theme_classic()
+
+ggplot(data = cb_all, aes(x = mean_trip_duration, fill = factor(peak_period))) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~trip_type, nrow = 4)
+  labs(title = "Density Plot of Mean Trip Duration, January 2025",
+       x = "Mean Trip Duration (minutes)",
+       y = "Density",
+       fill = "CPZ Pricing Period") +
+  theme_classic()
+
+ggplot(data = cb_all, aes(x = mean_trip_duration, fill = factor(trip_type))) +
+  geom_density(alpha = 0.5) 
+  labs(title = "Density Plot of Mean Trip Duration, January 2025",
+       x = "Mean Trip Duration (minutes)",
+       y = "Density",
+       fill = "Trip Type") +
+  theme_classic()
+  
+  trip_duration_plot <- cb_all %>%
+    group_by(start_hour, trip_type) %>%
+    summarise(mean_duration = mean(mean_trip_duration, na.rm = TRUE), .groups = "drop")
+  
+  # Create the plot
+  ggplot(trip_duration_plot, aes(x = start_hour, y = mean_duration, color = trip_type, group = trip_type)) +
+    geom_line(size = 1) +  # Line plot
+    scale_x_continuous(breaks = seq(0, 23, by = 3), labels = c("12 AM", "3 AM", "6 AM", "9 AM", "12 PM", "3 PM", "6 PM", "9 PM")) +
+    scale_color_brewer(palette = "Dark2") +
+    labs(
+      title = "Mean Trip Duration by Hour of Day",
+      x = "Hour of Day",
+      y = "Trip Duration (minutes)",
+      color = "Trip Type"
+    ) +
+    theme_classic()
+
+  ggplot(cb_all, aes(x = start_hour, fill = trip_type)) +
+    geom_histogram(binwidth = 1, color = "black", alpha = 0.7) +
+    facet_wrap(~ trip_type, ncol = 2, scales = "free_y") +  # Facet by trip type
+    scale_x_continuous(
+      breaks = seq(0, 23, by = 3),
+      labels = c("12 AM", "3 AM", "6 AM", "9 AM", "12 PM", "3 PM", "6 PM", "9 PM")
+    ) +
+    scale_fill_brewer(palette = "Set3") +
+    labs(
+      title = "Distribution of Trips by Start Hour and Trip Type",
+      x = "Hour of Day",
+      y = "Trip Count",
+      fill = "Trip Type"
+    ) +
+    theme_minimal()
+  
+
+  # logistic reg - prob of entry(|starting outside) as function of distance
+#-----------------
+
+# EXPLORATORY DATA VIZ - SPATIAL
+
+#-----------------
+
+# note might be more efficient way of doing these statistic
+
+# trip counts per tract, all jan 
+  ggplot(
+    nyc_tract %>%
+      left_join(
+        cb_all %>%
+          group_by(start_tract_id) %>%
+          summarise(trip_count = sum(trip_count), .groups = "drop"),
+        by = c("CT2020" = "start_tract_id")
+      )
+  ) +
+    geom_sf(aes(fill = trip_count), color = "white", size = 0.1) +  # Fill by trip count
+    scale_fill_viridis_c(option = "magma", na.value = "gray90", name = "Trip Count") +
+    labs(
+      title = "Trip Counts by Census Tract - January 2025",
+      subtitle = "Aggregated based on trip start locations",
+      caption = "Source: Citibike Data"
+    ) +
+    theme_minimal()
+
+  # something off here - pretty sure there are not bikes in staten island
+  #maybe something to do with crs of trip data
+  # and central park?
+
+  
+  # percentile plots on trip type shares, peak, etc, heat/corr maps
+```
