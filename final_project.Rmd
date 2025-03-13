@@ -13,7 +13,25 @@ output:
     page-layout: full
 ---
 
+# Research Question and Motivation
+
+# Data Description
+
+# Data Cleaning
+
+# Data Analysis (by Theme)
+
+## Spatial Distribution of Citi Bike Stations
+
+## Etc
+
+# Summary
+
 ```{r}
+
+# notes - check spatial operations for assigning stations to tracts, and for checking if station within cpz (intersects?)
+
+
 #----------------------------------
 # SET-UP
 #----------------------------------
@@ -410,23 +428,18 @@ st_crs(sf.boundary_proj)
 st_crs(start_points_sf)
 st_crs(end_points_sf)
 
-# convert to dt for efficiency
-setDT(start_points_sf)
-setDT(end_points_sf)
+# calculate interaction with CPZ for start stations - nb check if st_within is correct operation to use here, check visually
+# may want to show this off a bit more, and see if buffer is appropriate/ intersects etc
+start_points_sf$start_in_cpz <- st_within(start_points_sf, sf.boundary_proj, sparse = FALSE)
 
-# calculate interaction with CPZ for start stations: which are within the zone? - double check
-start_points_sf <- start_points_sf[, geometry := st_transform(geometry, st_crs(sf.boundary_proj))
-][, start_in_cpz := st_within(geometry, sf.boundary_proj, sparse = FALSE)
-]
+# calculate interaction with CPZ for end stations
+end_points_sf$end_in_cpz <- st_within(end_points_sf, sf.boundary_proj, sparse = FALSE)
 
-# calculate interaction with CPZ for end stations: which are within the zone? - double check
-end_points_sf <- end_points_sf[, geometry := st_transform(geometry, st_crs(sf.boundary_proj))
-][, end_in_cpz := st_within(geometry, sf.boundary_proj, sparse = FALSE)
-]
+# merge back into the trip data, may want to change to dt for consistency
+cb_all <- cb_all %>%
+  left_join(start_points_sf %>% dplyr::select(start_station_name, start_in_cpz, start_tract_id, start_borough_name), by = "start_station_name") %>%
+  left_join(end_points_sf %>% dplyr::select(end_station_name, end_in_cpz, end_tract_id, end_borough_name), by = "end_station_name")
 
-# now, given the spatial information of interest has been retrieved, merge back into the origin-destination-peakhour-day trip data
-cb_all <- cb_all[start_points_sf, on = "start_station_name"]
-cb_all <- cb_all[end_points_sf, on = "end_station_name"]
 
 # add trip type indicator
 cb_all[, trip_type := fcase(
@@ -642,31 +655,48 @@ ggplot(data = cb_all, aes(x = mean_trip_duration, fill = factor(trip_type))) +
 
 #-----------------
 
-# note might be more efficient way of doing these statistic
+     # check visually which join might be most appropriate
+leaflet() %>%
+  addTiles() %>%
+  addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
 
-# trip counts per tract, all jan 
-  ggplot(
-    nyc_tract %>%
-      left_join(
-        cb_all %>%
-          group_by(start_tract_id) %>%
-          summarise(trip_count = sum(trip_count), .groups = "drop"),
-        by = c("CT2020" = "start_tract_id")
-      )
-  ) +
-    geom_sf(aes(fill = trip_count), color = "white", size = 0.1) +  # Fill by trip count
-    scale_fill_viridis_c(option = "magma", na.value = "gray90", name = "Trip Count") +
-    labs(
-      title = "Trip Counts by Census Tract - January 2025",
-      subtitle = "Aggregated based on trip start locations",
-      caption = "Source: Citibike Data"
-    ) +
-    theme_minimal()
+  # Add Manhattan Census Tracts (outline only, no colors)
+  addPolygons(data = nyc_tract,
+              color = "black", weight = 0.5, fillOpacity = 0,  # No fill, just outline
+              popup = ~paste("Tract ID:", CT2020)) %>%
 
-  # something off here - pretty sure there are not bikes in staten island
-  #maybe something to do with crs of trip data
-  # and central park?
+  # Add Start Stations in Manhattan
+  addCircleMarkers(data = start_points_sf,, 
+                   color = "blue", radius = 2, opacity = 0.8, 
+                   popup = ~start_station_name) %>%
 
+  # Add Legend
+  addLegend(position = "bottomright", 
+            colors = c("black", "blue"), 
+            labels = c("Census Tracts", "Start Stations"))
+
+   # same story with the cpz
+leaflet() %>%
+  addTiles() %>%
+  addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
+
+  # Add CPZ Boundary in red
+  addPolygons(data = sf.boundary_proj, 
+              color = "red", weight = 2, fillOpacity = 0.2, 
+              popup = "CPZ Boundary") %>%
+
+  # Add Manhattan Start Stations (filtered within leaflet)
+  addCircleMarkers(data = start_points_sf, 
+                   color = "blue", radius = 2, opacity = 0.8, 
+                   popup = ~start_station_name) %>%
+
+  # Add Legend
+  addLegend(position = "bottomright", 
+            colors = c("red", "blue"), 
+            labels = c("CPZ Boundary", "Start Stations"))
+
+
+# staten island issue 
   
   # percentile plots on trip type shares, peak, etc, heat/corr maps
 ```
