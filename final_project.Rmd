@@ -31,6 +31,8 @@ output:
 
 # notes - check spatial operations for assigning stations to tracts, and for checking if station within cpz (intersects?)
 
+# notes - make sure to order sense checks for stations and boroughs, and stations trip type and crz well for flow
+
 
 #----------------------------------
 # SET-UP
@@ -154,32 +156,31 @@ st_crs(end_points_sf)
 
 # assign tract and borough to each start station
 start_points_sf <- st_join(start_points_sf, nyc_tract, left = TRUE) %>%
-  dplyr::select(start_station_name, start_tract_id = CT2020, start_borough_name = BoroName, geometry)
+  dplyr::select(start_station_name, start_tract_geoid = GEOID, start_borough_name = BoroName, geometry)
 
 # same for end
 end_points_sf <- st_join(end_points_sf, nyc_tract, left = TRUE) %>%
-  dplyr::select(end_station_name, end_tract_id = CT2020, end_borough_name = BoroName, geometry)
+  dplyr::select(end_station_name, end_tract_geoid = GEOID, end_borough_name = BoroName, geometry)
 
 # verify crs still correct
 st_crs(start_points_sf)
 st_crs(end_points_sf)
 
 # check for any NAs
-print(sum(is.na(start_points_sf$start_tract_id)))
-print(sum(is.na(end_points_sf$end_tract_id)))
+print(sum(is.na(start_points_sf$start_tract_geoid)))
+print(sum(is.na(end_points_sf$end_tract_geoid)))
 
 # inspect
 start_points_sf %>% 
-  filter(is.na(start_tract_id)) %>% 
-  head() # liberty light rail in NJ? + LA demo?
-# only n=2 obs in cb all, so can drop
+  filter(is.na(start_tract_geoid)) %>% 
+  head() 
 
 end_points_sf %>% 
-  filter(is.na(end_tract_id)) %>% 
+  filter(is.na(end_tract_geoid)) %>% 
   head()
 
 na_end_tract <- end_points_sf %>% 
-  filter(is.na(end_tract_id)) # approx 160 or so obs in cball
+  filter(is.na(end_tract_geoid)) # approx 160 or so obs in cball
 
 # nb - looks like these ended in NJ, so need info on that?
 # going to drop them for now.
@@ -435,10 +436,29 @@ start_points_sf$start_in_cpz <- st_within(start_points_sf, sf.boundary_proj, spa
 # calculate interaction with CPZ for end stations
 end_points_sf$end_in_cpz <- st_within(end_points_sf, sf.boundary_proj, sparse = FALSE)
 
+# also sense checks of cpz interactions
+ggplot() +
+  geom_sf(data = nyc_tract %>% filter(BoroName == "Manhattan"), fill = "gray90", color = "white", size = 0.1) +
+  geom_sf(data = sf.boundary_proj, fill = "red", alpha = 0.5) +
+  geom_sf(data = start_points_sf %>% filter(start_borough_name == "Manhattan"), aes(color = start_in_cpz), size = 2, alpha = 0.7) +
+  labs(title = "CitiBike Start Stations and CPZ",
+       subtitle = "Stations Colored by Whether They Are Inside CPZ",
+       color = "In CPZ") +
+  theme_classic()
+
+ggplot() +
+  geom_sf(data = nyc_tract %>% filter(BoroName == "Manhattan"), fill = "gray90", color = "white", size = 0.1) +
+  geom_sf(data = sf.boundary_proj, fill = "red", alpha = 0.5) +
+  geom_sf(data = end_points_sf %>% filter(end_borough_name == "Manhattan"), aes(color = end_in_cpz), size = 2, alpha = 0.7) +
+  labs(title = "CitiBike End Stations and CPZ",
+       subtitle = "Stations Colored by Whether They Are Inside CPZ",
+       color = "In CPZ") +
+  theme_classic()
+
 # merge back into the trip data, may want to change to dt for consistency
 cb_all <- cb_all %>%
-  left_join(start_points_sf %>% dplyr::select(start_station_name, start_in_cpz, start_tract_id, start_borough_name), by = "start_station_name") %>%
-  left_join(end_points_sf %>% dplyr::select(end_station_name, end_in_cpz, end_tract_id, end_borough_name), by = "end_station_name")
+  left_join(start_points_sf %>% dplyr::select(start_station_name, start_in_cpz, start_tract_geoid, start_borough_name), by = "start_station_name") %>%
+  left_join(end_points_sf %>% dplyr::select(end_station_name, end_in_cpz, end_tract_geoid, end_borough_name), by = "end_station_name")
 
 
 # add trip type indicator
@@ -649,13 +669,42 @@ ggplot(data = cb_all, aes(x = mean_trip_duration, fill = factor(trip_type))) +
   
 
   # logistic reg - prob of entry(|starting outside) as function of distance
+  
+  
+  library(ggplot2)
+library(dplyr)
+
+# Aggregate data: Count trips by hour, borough, and trip type
+hourly_trip_distribution <- cb_all %>%
+  group_by(start_borough_name, start_hour, trip_type) %>%
+  summarise(trip_count = n(), .groups = "drop") %>%
+  group_by(start_borough_name, start_hour) %>%
+  mutate(
+    total_trips = sum(trip_count),  # Total trips per hour in the borough
+    proportion = trip_count / total_trips  # Compute proportion
+  )
+
+# Plot: 100% Stacked Bar Chart
+ggplot(hourly_trip_distribution, aes(x = start_hour, y = proportion, fill = trip_type)) +
+  geom_bar(stat = "identity", position = "fill") +  # Fill makes it 100% stacked
+  facet_wrap(~ start_borough_name, scales = "free_y") +  # Separate by borough
+  scale_fill_brewer(palette = "Set3") +  # Color scheme for trip types
+  scale_x_continuous(breaks = seq(0, 23, by = 3), labels = c("12AM", "3AM", "6AM", "9AM", "12PM", "3PM", "6PM", "9PM")) +
+  labs(
+    title = "Proportion of Trip Types by Hour (Faceted by Borough)",
+    x = "Hour of Day",
+    y = "Proportion of Trips",
+    fill = "Trip Type"
+  ) +
+  theme_minimal()
+
 #-----------------
 
 # EXPLORATORY DATA VIZ - SPATIAL
 
 #-----------------
 
-     # check visually which join might be most appropriate
+# check visually which join might be most appropriate 
 leaflet() %>%
   addTiles() %>%
   addProviderTiles(leaflet::providers$CartoDB.Positron) %>%
@@ -696,7 +745,82 @@ leaflet() %>%
             labels = c("CPZ Boundary", "Start Stations"))
 
 
-# staten island issue 
-  
-  # percentile plots on trip type shares, peak, etc, heat/corr maps
+
+
+
+# now some other zonal stats
+
+
+# Aggregate data to calculate trip type percentages per census tract
+tract_trip_crz <- cb_all %>%
+  group_by(start_tract_geoid) %>%
+  summarise(
+    total_trips = n(),
+    percentage_entering_cpz = sum(trip_type == "Entered CPZ", na.rm = TRUE) / total_trips * 100,
+    percentage_exiting_cpz = sum(trip_type == "Exited CPZ", na.rm = TRUE) / total_trips * 100,
+    percentage_staying_cpz = sum(trip_type == "Stayed Inside CPZ", na.rm = TRUE) / total_trips * 100,
+    percentage_outside_cpz = sum(trip_type == "Stayed Outside CPZ", na.rm = TRUE) / total_trips * 100
+  ) %>%
+  mutate(trip_quintile = ntile(total_trips, 5))  # Assigns each tract to a quintile (1 = lowest, 5 = highest)
+
+
+# Merge with census tract shapefile
+nyc_tract_merged_crz <- nyc_tract %>%
+  left_join(tract_trip_crz, by = c("GEOID" = "start_tract_geoid"))
+
+# Define a function to create maps
+plot_tract_map <- function(data, fill_var, title, fill_label) {
+  ggplot(data) +
+    geom_sf(aes_string(fill = fill_var), color = "white", size = 0.1) +
+    scale_fill_viridis_c(option = "plasma", na.value = "grey80") +  
+    labs(
+      title = title,
+      fill = fill_label
+    ) +
+    theme_classic()
+}
+
+# Remove Staten Island to focus on NYC core
+nyc_tract_filtered <- nyc_tract_merged_crz %>% filter(BoroName != "Staten Island")
+
+# Plot: Total Trips per Census Tract
+plot_tract_map(nyc_tract_filtered, "total_trips", 
+               "Total Trips by Census Tract (January 2025)", "Total Trips")
+
+# Plot: Percentage of Trips Entering CPZ
+plot_tract_map(nyc_tract_filtered, "percentage_entering_cpz", 
+               "Percentage of Trips Entering CPZ (January 2025)", "% Entering CPZ")
+
+# Plot: Percentage of Trips Exiting CPZ
+plot_tract_map(nyc_tract_filtered, "percentage_exiting_cpz", 
+               "Percentage of Trips Exiting CPZ (January 2025)", "% Exiting CPZ")
+
+# Plot: Percentage of Trips Staying Inside CPZ
+plot_tract_map(nyc_tract_filtered, "percentage_staying_cpz", 
+               "Percentage of Trips Staying Inside CPZ (January 2025)", "% Staying Inside CPZ")
+
+# Plot: Percentage of Trips Staying Outside CPZ
+plot_tract_map(nyc_tract_filtered, "percentage_outside_cpz", 
+               "Percentage of Trips Staying Outside CPZ (January 2025)", "% Staying Outside CPZ")
+
+# Plot: Trip Quintiles (Low-High Activity Areas)
+ggplot(nyc_tract_filtered) +
+  geom_sf(aes(fill = factor(trip_quintile)), color = "white", size = 0.1) +
+  scale_fill_brewer(palette = "Blues", na.value = "grey80") +
+  labs(
+    title = "Trip Quintiles by Census Tract (January 2025)",
+    fill = "Trip Quintile (1 = Low, 5 = High)"
+  ) +
+  theme_classic()
+
+ggplot(nyc_tract_filtered %>% filter(!is.na(trip_quintile))) +
+  geom_sf(aes(fill = factor(trip_quintile)), color = "white", size = 0.1) +
+  scale_fill_brewer(palette = "Blues", na.value = "grey80") +
+  labs(
+    title = "Trip Quintiles by Census Tract (January 2025)",
+    fill = "Trip Quintile (1 = Low, 5 = High)"
+  ) +
+  theme_classic()
+
+
 ```
